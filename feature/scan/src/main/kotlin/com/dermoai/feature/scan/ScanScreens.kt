@@ -5,6 +5,7 @@ import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Matrix
+import android.media.ExifInterface
 import android.net.Uri
 import android.util.Log
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -43,6 +44,7 @@ import androidx.compose.material.icons.outlined.FlashOff
 import androidx.compose.material.icons.outlined.FlashOn
 import androidx.compose.material.icons.outlined.Info
 import androidx.compose.material.icons.outlined.LocationOn
+import androidx.compose.material.icons.outlined.Warning
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -123,6 +125,8 @@ class ScanViewModel @Inject constructor(
     private val ruleEngine: RuleBasedFilterEngine,
 ) : ViewModel() {
 
+    private val imageQualityChecker = ImageQualityChecker()
+
     var capturedPhotoPath by mutableStateOf<String?>(null)
         private set
     var inferenceState by mutableStateOf<InferenceUiState>(InferenceUiState.Idle)
@@ -165,8 +169,17 @@ class ScanViewModel @Inject constructor(
         capturedPhotoPath = path
     }
 
+    /**
+     * Runs the image quality check on a saved photo. The checker decodes a
+     * downsampled copy (never the full-resolution bitmap) and fails open on
+     * unreadable files, so the existing inference error state handles those.
+     */
+    suspend fun assessImage(photoPath: String): ImageQualityReport = withContext(Dispatchers.Default) {
+        imageQualityChecker.assessFile(photoPath)
+    }
+
     fun cropAndSave(sourcePath: String, rect: CropRect, rotation: Float): String {
-        val src = BitmapFactory.decodeFile(sourcePath)
+        val src = decodeUpright(sourcePath, MAX_CROP_PX)
             ?: throw IllegalArgumentException("Failed to decode image")
         val bw = src.width.toFloat()
         val bh = src.height.toFloat()
@@ -191,7 +204,7 @@ class ScanViewModel @Inject constructor(
         try {
             // Decode the full-resolution capture off the main thread — an in-memory
             // decode here can take hundreds of ms and ANR on low-memory devices.
-            val bitmap = withContext(Dispatchers.IO) { BitmapFactory.decodeFile(photoPath) }
+            val bitmap = withContext(Dispatchers.IO) { decodeUpright(photoPath, MAX_CROP_PX) }
             if (bitmap == null) {
                 inferenceState = InferenceUiState.Error("Failed to load image")
                 return
@@ -281,6 +294,61 @@ data class CropRect(
     val width: Float = 0.8f,
     val height: Float = 0.7f,
 )
+
+/** Longest edge kept when decoding for on-screen preview / for the crop source. */
+private const val MAX_PREVIEW_PX = 1280
+private const val MAX_CROP_PX = 2048
+
+/**
+ * Decodes [path] downscaled to roughly [maxDimension] px on its longest edge (subsampling
+ * is limited to powers of two, so the result is never *smaller* than that), with any EXIF
+ * orientation baked in — [BitmapFactory] ignores EXIF, which otherwise leaves gallery and
+ * camera photos sideways. A rotated photo reaches the model rotated, and the resulting
+ * misclassification looks like a model fault rather than a decoding one.
+ */
+private fun decodeUpright(path: String, maxDimension: Int): Bitmap? {
+    if (path.isEmpty()) return null
+    val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+    BitmapFactory.decodeFile(path, bounds)
+    if (bounds.outWidth <= 0 || bounds.outHeight <= 0) return null
+
+    var sampleSize = 1
+    while (maxOf(bounds.outWidth, bounds.outHeight) / (sampleSize * 2) >= maxDimension) {
+        sampleSize *= 2
+    }
+    val decoded = BitmapFactory.decodeFile(path, BitmapFactory.Options().apply {
+        inSampleSize = sampleSize
+    }) ?: return null
+
+    val matrix = exifMatrix(path) ?: return decoded
+    return runCatching {
+        Bitmap.createBitmap(decoded, 0, 0, decoded.width, decoded.height, matrix, true)
+            .also { if (it !== decoded) decoded.recycle() }
+    }.getOrDefault(decoded)
+}
+
+/** Transform that puts [path] upright, or null when no correction is needed. */
+private fun exifMatrix(path: String): Matrix? {
+    val orientation = runCatching {
+        ExifInterface(path).getAttributeInt(
+            ExifInterface.TAG_ORIENTATION,
+            ExifInterface.ORIENTATION_NORMAL,
+        )
+    }.getOrDefault(ExifInterface.ORIENTATION_NORMAL)
+
+    return Matrix().apply {
+        when (orientation) {
+            ExifInterface.ORIENTATION_ROTATE_90 -> postRotate(90f)
+            ExifInterface.ORIENTATION_ROTATE_180 -> postRotate(180f)
+            ExifInterface.ORIENTATION_ROTATE_270 -> postRotate(270f)
+            ExifInterface.ORIENTATION_FLIP_HORIZONTAL -> postScale(-1f, 1f)
+            ExifInterface.ORIENTATION_FLIP_VERTICAL -> postScale(1f, -1f)
+            ExifInterface.ORIENTATION_TRANSPOSE -> { postRotate(90f); postScale(-1f, 1f) }
+            ExifInterface.ORIENTATION_TRANSVERSE -> { postRotate(270f); postScale(-1f, 1f) }
+            else -> return null
+        }
+    }
+}
 
 @Composable
 fun ScanEntryScreen(
@@ -740,6 +808,20 @@ fun ScanReviewScreen(
 ) {
     var cropRect by remember { mutableStateOf(CropRect(0.15f, 0.2f, 0.7f, 0.5f)) }
     var rotation by remember { mutableFloatStateOf(0f) }
+    val scope = rememberCoroutineScope()
+
+    // Image quality gate: set when the cropped photo fails the quality check.
+    var qualityWarning by remember { mutableStateOf<ImageQualityReport?>(null) }
+    var pendingPhotoPath by remember { mutableStateOf<String?>(null) }
+    // Guards against double-taps while the (fast) quality check is running.
+    var assessing by remember { mutableStateOf(false) }
+
+    fun confirmAndAnalyze(cropped: String) {
+        qualityWarning = null
+        pendingPhotoPath = null
+        assessing = false
+        onUsePhoto(cropped)
+    }
 
     val nudge = 0.03f
     fun wider() = cropRect.copy(width = (cropRect.width + nudge).coerceAtMost(0.95f - cropRect.offsetX))
@@ -763,7 +845,11 @@ fun ScanReviewScreen(
         }
 
         Box(Modifier.weight(1f).fillMaxWidth().padding(horizontal = 20.dp)) {
-            val bmp = remember(photoPath) { if (photoPath.isNotEmpty()) BitmapFactory.decodeFile(photoPath) else null }
+            // Must stay EXIF-aware in lockstep with cropAndSave: CropRect is fractional,
+            // expressed in the coordinate space of whatever bitmap this screen displays.
+            // If the preview stayed raw while the crop went upright, the box drawn over a
+            // lesion would silently crop background on any rotated photo.
+            val bmp = remember(photoPath) { if (photoPath.isNotEmpty()) decodeUpright(photoPath, MAX_PREVIEW_PX) else null }
             if (bmp != null) {
                 Image(bmp.asImageBitmap(), "Captured photo", Modifier.fillMaxSize())
                 CropOverlay(
@@ -801,19 +887,90 @@ fun ScanReviewScreen(
         }
 
         MedicalDisclaimerBar()
+
+        qualityWarning?.let { report ->
+            Surface(
+                modifier = Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 4.dp),
+                color = DermoColors.Bloom,
+                shape = RoundedCornerShape(12.dp),
+            ) {
+                Column(Modifier.padding(horizontal = 12.dp, vertical = 10.dp)) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Icon(
+                            Icons.Outlined.Warning,
+                            null,
+                            tint = DermoColors.AmberText,
+                            modifier = Modifier.size(18.dp),
+                        )
+                        Spacer(Modifier.width(8.dp))
+                        Text(
+                            "Improve photo quality",
+                            style = MaterialTheme.typography.titleSmall,
+                            color = DermoColors.AmberText,
+                        )
+                    }
+                    Spacer(Modifier.height(4.dp))
+                    Text(
+                        report.issues.joinToString(" · ") { it.message },
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = DermoColors.AmberText,
+                    )
+                    Text(
+                        report.issues.first().guidance,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = DermoColors.AmberText,
+                    )
+                    Spacer(Modifier.height(8.dp))
+                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                        NeuButton(
+                            onClick = { pendingPhotoPath?.let { confirmAndAnalyze(it) } },
+                            modifier = Modifier.weight(1f),
+                            containerColor = DermoColors.TealAccent,
+                            contentColor = MaterialTheme.colorScheme.onPrimary,
+                        ) { Text("Analyze anyway") }
+                        OutlinedNeuButton(
+                            onClick = {
+                                qualityWarning = null
+                                pendingPhotoPath = null
+                            },
+                            modifier = Modifier.weight(1f),
+                        ) { Text("Adjust crop") }
+                    }
+                }
+            }
+        }
+
         Row(Modifier.fillMaxWidth().padding(20.dp), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
             OutlinedNeuButton(onRetake, Modifier.weight(1f)) { Text("Retake") }
             NeuButton(
                 onClick = {
+                    if (assessing) return@NeuButton
+                    assessing = true
                     val cropped = try {
                         viewModel.cropAndSave(photoPath, cropRect, rotation)
                     } catch (_: Exception) { photoPath }
-                    onUsePhoto(cropped)
+                    scope.launch {
+                        try {
+                            val report = viewModel.assessImage(cropped)
+                            if (report.issues.isEmpty()) {
+                                confirmAndAnalyze(cropped)
+                            } else {
+                                pendingPhotoPath = cropped
+                                qualityWarning = report
+                                assessing = false
+                            }
+                        } catch (_: Exception) {
+                            // Never trap the user on a stuck button — fall back to analyzing.
+                            assessing = false
+                            confirmAndAnalyze(cropped)
+                        }
+                    }
                 },
                 modifier = Modifier.weight(1f),
+                enabled = !assessing,
                 containerColor = DermoColors.TealAccent,
                 contentColor = MaterialTheme.colorScheme.onPrimary,
-            ) { Text("Analyze") }
+            ) { Text(if (assessing) "Checking…" else "Analyze") }
         }
     }
 }
@@ -940,7 +1097,7 @@ private fun ResultsContent(
     showDoctorCta: Boolean,
     onFindDermatologist: () -> Unit,
 ) {
-    val bmp = remember(photoPath) { BitmapFactory.decodeFile(photoPath) }
+    val bmp = remember(photoPath) { decodeUpright(photoPath, MAX_PREVIEW_PX) }
     val scrollState = rememberScrollState()
 
     Column(
